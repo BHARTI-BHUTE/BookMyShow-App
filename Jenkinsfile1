@@ -1,112 +1,92 @@
-(without K8S Stage)
+
 pipeline {
     agent any
+
     tools {
         jdk 'jdk17'
-        nodejs 'node23'
+        nodejs 'node18'
     }
+
     environment {
-        SCANNER_HOME = tool 'sonar-scanner'
+        DOCKER_IMAGE = 'bhartibhute/bookmyshow:v1'
+        DOCKER_CREDENTIALS = 'docker'
     }
+
     stages {
+
         stage('Clean Workspace') {
             steps {
                 cleanWs()
             }
         }
+
         stage('Checkout from Git') {
             steps {
-                git branch: 'main', url: 'https://github.com/KastroVKiran/Book-My-Show.git'
-                sh 'ls -la'  // Verify files after checkout
+                git branch: 'main',
+                    url: 'https://github.com/BHARTI-BHUTE/BookMyShow-App.git'
+
+                sh 'ls -la'
             }
         }
-        stage('SonarQube Analysis') {
+
+        stage('Install Dependencies') {
             steps {
-                withSonarQubeEnv('sonar-server') {
-                    sh ''' 
-                    $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=BMS \
-                    -Dsonar.projectKey=BMS 
+                dir('bookmyshow-app') {
+                    sh '''
+                        if [ -f package-lock.json ]; then
+                            npm ci --legacy-peer-deps
+                        else
+                            npm install --legacy-peer-deps
+                        fi
                     '''
                 }
             }
         }
-        stage('Quality Gate') {
+
+        stage('Build Application') {
             steps {
-                script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token'
+                dir('bookmyshow-app') {
+                    sh 'NODE_OPTIONS=--openssl-legacy-provider npm run build'
                 }
             }
         }
-        stage('Install Dependencies') {
+
+        stage('Docker Build') {
             steps {
                 sh '''
-                cd bookmyshow-app
-                ls -la  # Verify package.json exists
-                if [ -f package.json ]; then
-                    rm -rf node_modules package-lock.json  # Remove old dependencies
-                    npm install  # Install fresh dependencies
-                else
-                    echo "Error: package.json not found in bookmyshow-app!"
-                    exit 1
-                fi
+                    docker build -t ${DOCKER_IMAGE} \
+                    -f bookmyshow-app/Dockerfile bookmyshow-app
                 '''
             }
         }
-        stage('OWASP FS Scan') {
-            steps {
-                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-            }
-        }
-        stage('Trivy FS Scan') {
-            steps {
-                sh 'trivy fs . > trivyfs.txt'
-            }
-        }
-        stage('Docker Build & Push') {
+
+        stage('Docker Push') {
             steps {
                 script {
-                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
-                        sh ''' 
-                        echo "Building Docker image..."
-                        docker build --no-cache -t kastrov/bms:latest -f bookmyshow-app/Dockerfile bookmyshow-app
-
-                        echo "Pushing Docker image to registry..."
-                        docker push kastrov/bms:latest
-                        '''
+                    withDockerRegistry(
+                        credentialsId: "${DOCKER_CREDENTIALS}",
+                        toolName: 'docker'
+                    ) {
+                        sh 'docker push ${DOCKER_IMAGE}'
                     }
                 }
             }
         }
-        stage('Deploy to Container') {
+
+        stage('Deploy to Kubernetes') {
             steps {
-                sh ''' 
-                echo "Stopping and removing old container..."
-                docker stop bms || true
-                docker rm bms || true
+                sh '''
+                    kubectl apply -f namespace.yml
+                    kubectl apply -f deployment.yml
+                    kubectl apply -f service.yml
 
-                echo "Running new container on port 3000..."
-                docker run -d --restart=always --name bms -p 3000:3000 kastrov/bms:latest
+                    kubectl rollout status deployment/bms-app \
+                    -n bookmyshow --timeout=180s
 
-                echo "Checking running containers..."
-                docker ps -a
-
-                echo "Fetching logs..."
-                sleep 5  # Give time for the app to start
-                docker logs bms
+                    kubectl get pods -n bookmyshow
+                    kubectl get services -n bookmyshow
                 '''
             }
-        }
-    }
-    post {
-        always {
-            emailext attachLog: true,
-                subject: "'${currentBuild.result}'",
-                body: "Project: ${env.JOB_NAME}<br/>" +
-                      "Build Number: ${env.BUILD_NUMBER}<br/>" +
-                      "URL: ${env.BUILD_URL}<br/>",
-                to: 'kastrokiran@gmail.com',
-                attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
         }
     }
 }
